@@ -59,7 +59,7 @@ MAX_CONSECUTIVE_500_ERRORS = int(os.getenv("MAX_CONSECUTIVE_500_ERRORS", 10)) # 
 INFLUXDB_ENDPOINT_IS_HTTP = False if os.getenv("INFLUXDB_ENDPOINT_IS_HTTP") in ['False','false','FALSE','f','F','no','No','NO','0'] else True # optional
 GARMIN_DEVICENAME_AUTOMATIC = False if GARMIN_DEVICENAME != "Unknown" else True # optional
 UPDATE_INTERVAL_SECONDS = int(os.getenv("UPDATE_INTERVAL_SECONDS", 300)) # optional
-FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity which you can add to the list seperated by , without any space
+FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity,cycling_dynamics which you can add to the list seperated by , without any space
 ACTIVITY_TYPE_FILTER = [t.strip().lower() for t in os.getenv("ACTIVITY_TYPE_FILTER", "").split(",") if t.strip()] # optional, comma-separated list of activity typeKeys to import only specific activity types. Leave empty to import all. Known typeKeys: running,treadmill_running,indoor_running,cycling,indoor_cycling,road_biking,mountain_biking,walking,hiking,mountaineering,strength_training,hiit,indoor_cardio,elliptical,lap_swimming,open_water_swimming,rock_climbing,indoor_climbing,tennis_v2,kayaking_v2,boating_v2,multi_sport,other
 LACTATE_THRESHOLD_SPORTS = os.getenv("LACTATE_THRESHOLD_SPORTS", "RUNNING").upper().split(",") # Garmin currently implements RUNNING, but has provisions for CYCLING, and SWIMMING
 KEEP_FIT_FILES = True if os.getenv("KEEP_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional
@@ -842,6 +842,144 @@ def get_strength_training_data(strength_activity_id_dict):
     return points_list
 
 # %%
+def _build_cycling_dynamics_point(all_records_list, all_sessions_list, activityID, activity_type, activity_start_time):
+    def avg_nonzero(records, key):
+        vals = [r[key] for r in records if r.get(key) not in (None, 0)]
+        return sum(vals) / len(vals) if vals else None
+
+    def session_phase_component(session, key, index):
+        """Extract one angle from a power phase tuple field; skip None/0 entries."""
+        v = session.get(key)
+        if v is None:
+            return None
+        try:
+            item = v[index] if hasattr(v, '__getitem__') else v
+            return float(item) if item not in (None, 0) else None
+        except (IndexError, TypeError):
+            return None
+
+    def record_phase_avg(records, key, index):
+        """Average one component of a per-record power phase tuple field."""
+        vals = []
+        for r in records:
+            v = r.get(key)
+            if v is None:
+                continue
+            try:
+                item = v[index] if hasattr(v, '__getitem__') else v
+                if item not in (None, 0):
+                    vals.append(item)
+            except (IndexError, TypeError):
+                pass
+        return sum(vals) / len(vals) if vals else None
+
+    fields = {}
+
+    # --- Session-level pre-computed averages (primary source) ---
+    if all_sessions_list:
+        session = all_sessions_list[0]
+
+        # Scalar fields — ANT+ standard
+        for src, dst in [
+            ('avg_left_torque_effectiveness',  'avg_left_torque_effectiveness'),
+            ('avg_right_torque_effectiveness', 'avg_right_torque_effectiveness'),
+            ('avg_left_pedal_smoothness',      'avg_left_pedal_smoothness'),
+            ('avg_right_pedal_smoothness',     'avg_right_pedal_smoothness'),
+            ('avg_left_pco',                   'avg_left_pco'),
+            ('avg_right_pco',                  'avg_right_pco'),
+        ]:
+            v = session.get(src)
+            if v is not None:
+                fields[dst] = float(v)
+
+        # Power phase tuples — Garmin Vector/Rally exclusive
+        # fitparse returns avg_left_power_phase as (start, end, ...) in degrees
+        for field_key, idx, dst in [
+            ('avg_left_power_phase',       0, 'avg_left_power_phase_start'),
+            ('avg_left_power_phase',       1, 'avg_left_power_phase_end'),
+            ('avg_right_power_phase',      0, 'avg_right_power_phase_start'),
+            ('avg_right_power_phase',      1, 'avg_right_power_phase_end'),
+            ('avg_left_power_phase_peak',  0, 'avg_left_power_phase_peak_start'),
+            ('avg_left_power_phase_peak',  1, 'avg_left_power_phase_peak_end'),
+            ('avg_right_power_phase_peak', 0, 'avg_right_power_phase_peak_start'),
+            ('avg_right_power_phase_peak', 1, 'avg_right_power_phase_peak_end'),
+        ]:
+            v = session_phase_component(session, field_key, idx)
+            if v is not None:
+                fields[dst] = v
+
+        # Power summary fields
+        for src, dst in [
+            ('normalized_power',      'normalized_power'),
+            ('training_stress_score', 'training_stress_score'),
+            ('intensity_factor',      'intensity_factor'),
+        ]:
+            v = session.get(src)
+            if v is not None:
+                fields[dst] = float(v)
+
+        # left_right_balance: FIT uint16 bitmask — bit15 set means right% is known,
+        # lower 15 bits / 100 = right power percentage; we store left% for readability.
+        lrb = session.get('left_right_balance')
+        if lrb is not None:
+            try:
+                raw = int(lrb)
+                if raw & 0x8000:
+                    fields['left_right_balance'] = round(100.0 - (raw & 0x7FFF) / 100.0, 2)
+                elif raw > 0:
+                    fields['left_right_balance'] = float(raw)
+            except (ValueError, TypeError):
+                pass
+
+    # --- Per-record fallback (for devices that store dynamics in record messages) ---
+    for src, dst in [
+        ('left_torque_effectiveness',  'avg_left_torque_effectiveness'),
+        ('right_torque_effectiveness', 'avg_right_torque_effectiveness'),
+        ('left_pedal_smoothness',      'avg_left_pedal_smoothness'),
+        ('right_pedal_smoothness',     'avg_right_pedal_smoothness'),
+        ('left_pco',                   'avg_left_pco'),
+        ('right_pco',                  'avg_right_pco'),
+    ]:
+        if dst not in fields:
+            v = avg_nonzero(all_records_list, src)
+            if v is not None:
+                fields[dst] = v
+
+    for field_key, idx, dst in [
+        ('left_power_phase',       0, 'avg_left_power_phase_start'),
+        ('left_power_phase',       1, 'avg_left_power_phase_end'),
+        ('right_power_phase',      0, 'avg_right_power_phase_start'),
+        ('right_power_phase',      1, 'avg_right_power_phase_end'),
+        ('left_power_phase_peak',  0, 'avg_left_power_phase_peak_start'),
+        ('left_power_phase_peak',  1, 'avg_left_power_phase_peak_end'),
+        ('right_power_phase_peak', 0, 'avg_right_power_phase_peak_start'),
+        ('right_power_phase_peak', 1, 'avg_right_power_phase_peak_end'),
+    ]:
+        if dst not in fields:
+            v = record_phase_avg(all_records_list, field_key, idx)
+            if v is not None:
+                fields[dst] = v
+
+    # Guard: write nothing if no cycling dynamics data was found
+    if not fields:
+        return None
+
+    fields['ActivityName'] = activity_type
+    fields['Activity_ID'] = activityID
+
+    return {
+        "measurement": "CyclingDynamics",
+        "time": activity_start_time.isoformat(),
+        "tags": {
+            "Device": GARMIN_DEVICENAME,
+            "Database_Name": INFLUXDB_DATABASE,
+            "ActivityID": activityID,
+            "ActivitySelector": activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type
+        },
+        "fields": fields
+    }
+
+# %%
 def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back to TCX
     points_list = []
     for activityID in activityIDdict.keys():
@@ -1000,6 +1138,16 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                 }
                             }
                             points_list.append(point)
+                    # Extract cycling dynamics and advanced power metrics
+                    if 'cycling_dynamics' in FETCH_SELECTION:
+                        cycling_point = _build_cycling_dynamics_point(
+                            all_records_list, all_sessions_list,
+                            activityID, activity_type, activity_start_time
+                        )
+                        if cycling_point:
+                            points_list.append(cycling_point)
+                            logging.info(f"Activity ID {activityID}: CyclingDynamics point added ({len(cycling_point['fields']) - 2} metrics)")
+
                     if KEEP_FIT_FILES:
                         os.makedirs(FIT_FILE_STORAGE_LOCATION, exist_ok=True)
                         fit_path = os.path.join(FIT_FILE_STORAGE_LOCATION, activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type + ".fit")
